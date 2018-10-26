@@ -13,6 +13,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -418,40 +419,72 @@ func getKernelVersion() (float64, error) {
 	return kVer, nil
 }
 
+type CapturingPassThroughWriter struct {
+	buf bytes.Buffer
+	w   io.Writer
+}
+
+// NewCapturingPassThroughWriter creates new CapturingPassThroughWriter
+func NewCapturingPassThroughWriter(w io.Writer) *CapturingPassThroughWriter {
+	return &CapturingPassThroughWriter{
+		w: w,
+	}
+}
+
+// Write writes data to the writer, returns number of bytes written and an error
+func (w *CapturingPassThroughWriter) Write(d []byte) (int, error) {
+	w.buf.Write(d)
+	return w.w.Write(d)
+}
+
+// Bytes returns bytes written to the writer
+func (w *CapturingPassThroughWriter) Bytes() []byte {
+	return w.buf.Bytes()
+}
+
 // start eXtra service(s)
 // launched as a goroutine so that bash or program does not hold our PID1 listening for SIGTERM
 //
 func startExtraService(exeCmd string, exeOK chan bool) {
 	log.Printf("Starting eXtra service '%s' \n", exeCmd)
-
+	var errStdout, errStderr error
 	cmdName := exeCmd
 
 	// if user need to pass param to its shell it's preferable that they set environment variables
 	// via the -e VAR1=VAL syntax when launching a container
-	c := exec.Command(cmdName)
+	cmd := exec.Command(cmdName)
 
 	// preparing for stdout/stderr msg
-	var out bytes.Buffer
-	c.Stdout = &out
+	stdoutIn, _ := cmd.StdoutPipe()
+	stderrIn, _ := cmd.StderrPipe()
+	stdout := NewCapturingPassThroughWriter(os.Stdout)
+	stderr := NewCapturingPassThroughWriter(os.Stderr)
+	err := cmd.Start()
 
-	// with Start() there is no chance to monitor the return value...
-	if err := c.Start(); err != nil {
-		errMsg := out.String()
-		log.Printf("Error in starting eXtra service: '%s'; Err: %s; %s\n", exeCmd, errMsg, err)
-		//log.Printf("Err: %s; %s", errMsg, err)
-
-		exeOK <- false
-
-	} else {
-
-		if dbg {
-			log.Printf("exeOK == true")
-		}
-
-		// the call was OK
-		// a user is advised to log error messages to the container logs
-		exeOK <- true
+	if err != nil {
+		log.Fatal(err)
 	}
+
+	go func() {
+		_, errStdout = io.Copy(stdout, stdoutIn)
+	}()
+
+	go func() {
+		_, errStderr = io.Copy(stderr, stderrIn)
+	}()
+
+	err = cmd.Wait()
+
+	if err != nil {
+		log.Fatalf("Error in starting eXtra service: '%s'; Err: %s\n", exeCmd, err)
+		exeOK <- false
+	}
+	if errStdout != nil || errStderr != nil {
+		log.Fatalf("Error in starting eXtra service: '%s'; Err: %s\n", exeCmd, err)
+		exeOK <- false
+	}
+	exeOK <- true
+
 }
 
 // Stopping eXtra service(s)
@@ -541,6 +574,7 @@ func main() {
 
 	// allow other services to run before Cache starts
 	//
+
 	if exePreStart != "" {
 		var exeOK bool
 
